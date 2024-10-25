@@ -1,6 +1,7 @@
 /******************************************************************************
  * Copyright 2013-2015 Espressif Systems
  *           2015 <>< Charles Lohr
+ * 			 2022 Paul Schlarmann
  *
  * FileName: i2s_freertos.c
  *
@@ -11,6 +12,7 @@
  *     2015/06/01, v1.0 File created.
  *     2015/07/23, Switch to making it a WS2812 output device.
  *     2016/01/28, Modified to re-include TX_ stuff.
+ *     2022/09/26, Modified CNLohrs code to also allow PAL broadcast
 *******************************************************************************
 
 Notes:
@@ -37,18 +39,42 @@ Extra copyright info:
 
 
 #include "slc_register.h"
-#include "mystuff.h"
+#include "esp82xxutil.h"
 #include <c_types.h>
-#include "ntsc_broadcast.h"
+#include "video_broadcast.h"
 #include "user_interface.h"
-#include "pin_mux_register.h"
 #include "../tablemaker/broadcast_tables.h"
 #include <dmastuff.h>
+
+#define FUNC_I2SO_DATA                      1
 
 #define WS_I2S_BCK 1  //Can't be less than 1.
 #define WS_I2S_DIV 2
 
-#define I2SDMABUFLEN (159)		//Length of one buffer, in 32-bit words.
+#ifdef PAL
+  #define LINE_BUFFER_LENGTH 160
+
+  /* PAL signals */
+  #define SHORT_SYNC_INTERVAL    5
+  #define LONG_SYNC_INTERVAL    75
+  #define NORMAL_SYNC_INTERVAL  10
+  #define LINE_SIGNAL_INTERVAL 150
+
+  #define COLORBURST_INTERVAL 10
+#else
+  #define LINE_BUFFER_LENGTH 159
+
+  /* NTSC signals */
+  #define SHORT_SYNC_INTERVAL    6
+  #define LONG_SYNC_INTERVAL    73
+  #define SERRATION_PULSE_INT   67
+  #define NORMAL_SYNC_INTERVAL  12
+  #define LINE_SIGNAL_INTERVAL 147
+
+  #define COLORBURST_INTERVAL 4
+#endif
+
+#define I2SDMABUFLEN (LINE_BUFFER_LENGTH)		//Length of one buffer, in 32-bit words.
 //#define LINE16LEN (I2SDMABUFLEN*2)
 #define LINE32LEN I2SDMABUFLEN
 
@@ -114,57 +140,77 @@ LOCAL void fillwith( uint16_t qty, uint8_t color )
 
 //XXX TODO: Revisit the length of time the system is at SYNC, BLACK, etc.
 
-LOCAL void FT_STA()
+LOCAL void FT_STA() // Short Sync
 {
 	pixline = 0; //Reset the framebuffer out line count (can be done multiple times)
 
-	fillwith( 6, SYNC_LEVEL );
-	fillwith( 73, BLACK_LEVEL );
-	fillwith( 6, SYNC_LEVEL );
-	fillwith( LINE32LEN - (6+73+6), BLACK_LEVEL );
+	fillwith( SHORT_SYNC_INTERVAL, SYNC_LEVEL );
+	fillwith( LONG_SYNC_INTERVAL, BLACK_LEVEL );
+	fillwith( SHORT_SYNC_INTERVAL, SYNC_LEVEL );
+	fillwith( LINE32LEN - (SHORT_SYNC_INTERVAL+LONG_SYNC_INTERVAL+SHORT_SYNC_INTERVAL), BLACK_LEVEL );
 }
 
 
-LOCAL void FT_STB()
+LOCAL void FT_STB() // Long Sync
 {
-	fillwith( 68, SYNC_LEVEL );
-	fillwith( 11, BLACK_LEVEL );
-	fillwith( 68, SYNC_LEVEL );
-	fillwith( LINE32LEN - (68+11+68), BLACK_LEVEL );
+	#ifdef PAL
+		#define FT_STB_BLACK_INTERVAL SHORT_SYNC_INTERVAL
+	#else
+		#define FT_STB_BLACK_INTERVAL NORMAL_SYNC_INTERVAL
+	#endif
+	fillwith( LONG_SYNC_INTERVAL, SYNC_LEVEL );
+	fillwith( FT_STB_BLACK_INTERVAL, BLACK_LEVEL );
+	fillwith( LONG_SYNC_INTERVAL, SYNC_LEVEL );
+	fillwith( LINE32LEN - (LONG_SYNC_INTERVAL+FT_STB_BLACK_INTERVAL+LONG_SYNC_INTERVAL), BLACK_LEVEL );
 }
 
-LOCAL void FT_B()
+//Margin at top and bottom of screen (Mostly invisible)
+//Closed Captioning would go somewhere in here, I guess?
+LOCAL void FT_B() // Black
 {
-	fillwith( 12, SYNC_LEVEL );
+	fillwith( NORMAL_SYNC_INTERVAL, SYNC_LEVEL );
 	fillwith( 2, BLACK_LEVEL );
-	fillwith( 4, COLORBURST_LEVEL );
-	fillwith( LINE32LEN-12-6, BLACK_LEVEL );
+	fillwith( COLORBURST_INTERVAL, COLORBURST_LEVEL );
+	fillwith( LINE32LEN-NORMAL_SYNC_INTERVAL-2-COLORBURST_INTERVAL, (pixline<1)?GRAY_LEVEL:BLACK_LEVEL);
+	//Gray seems to help sync if at top.  TODO: Investigate if white works even better!
 }
 
-LOCAL void FT_SRA()
+LOCAL void FT_SRA() // Short to long
 {
-	fillwith( 6, SYNC_LEVEL );
-	fillwith( 73, BLACK_LEVEL );
-	fillwith( 68, SYNC_LEVEL );
-	fillwith( LINE32LEN - (6+73+68), BLACK_LEVEL );
+	fillwith( SHORT_SYNC_INTERVAL, SYNC_LEVEL );
+	fillwith( LONG_SYNC_INTERVAL, BLACK_LEVEL );
+	#ifdef PAL
+	fillwith( LONG_SYNC_INTERVAL, SYNC_LEVEL );
+	fillwith( LINE32LEN - (SHORT_SYNC_INTERVAL+LONG_SYNC_INTERVAL+LONG_SYNC_INTERVAL), BLACK_LEVEL );
+	#else
+	fillwith( SERRATION_PULSE_INT, SYNC_LEVEL );
+	fillwith( LINE32LEN - (SHORT_SYNC_INTERVAL+LONG_SYNC_INTERVAL+SERRATION_PULSE_INT), BLACK_LEVEL );
+	#endif
 }
 
-LOCAL void FT_SRB()
+LOCAL void FT_SRB() // Long to short
 {
-	fillwith( 68, SYNC_LEVEL );
-	fillwith( 11, BLACK_LEVEL );
-	fillwith( 6, SYNC_LEVEL );
-	fillwith( LINE32LEN - (6+11+68), BLACK_LEVEL );
+	#ifdef PAL
+	fillwith( LONG_SYNC_INTERVAL, SYNC_LEVEL );
+	fillwith( SHORT_SYNC_INTERVAL, BLACK_LEVEL );
+	fillwith( SHORT_SYNC_INTERVAL, SYNC_LEVEL );
+	fillwith( LINE32LEN - (LONG_SYNC_INTERVAL+SHORT_SYNC_INTERVAL+SHORT_SYNC_INTERVAL), BLACK_LEVEL );
+	#else
+	fillwith( SERRATION_PULSE_INT, SYNC_LEVEL );
+	fillwith( NORMAL_SYNC_INTERVAL, BLACK_LEVEL );
+	fillwith( SHORT_SYNC_INTERVAL, SYNC_LEVEL );
+	fillwith( LINE32LEN - (SERRATION_PULSE_INT+NORMAL_SYNC_INTERVAL+SHORT_SYNC_INTERVAL), BLACK_LEVEL );
+	#endif
 }
 
-LOCAL void FT_LIN()
+LOCAL void FT_LIN() // Line Signal
 {
 	//TODO: Make this do something useful.
-	fillwith( 12, SYNC_LEVEL );
+	fillwith( NORMAL_SYNC_INTERVAL, SYNC_LEVEL );
 	fillwith( 1, BLACK_LEVEL );
-	fillwith( 7, COLORBURST_LEVEL );
+	fillwith( COLORBURST_INTERVAL, COLORBURST_LEVEL );
 	fillwith( 11, BLACK_LEVEL );
-#define HDR_SPD (12+1+7+11)
+#define HDR_SPD (NORMAL_SYNC_INTERVAL+1+COLORBURST_INTERVAL+11)
 
 	int fframe = gframe & 1;
 //#define FILLTEST
@@ -199,7 +245,7 @@ LOCAL void FT_LIN()
 		if( tablept >= tableend ) tablept = tablept - tableend + tablestart;
 	}
 
-	fillwith( LINE32LEN - (HDR_SPD+FBW2), BLACK_LEVEL );
+	fillwith( LINE32LEN - (HDR_SPD+FBW2), BLACK_LEVEL); //WHITE_LEVEL );
 #endif
 
 	pixline++;
@@ -208,12 +254,19 @@ LOCAL void FT_LIN()
 static uint32_t systimex = 0;
 static uint32_t systimein = 0;
 uint32_t last_internal_frametime;
-LOCAL void FT_CLOSE_M()
+LOCAL void FT_CLOSE_M() // End Frame
 {
-	fillwith( 12, SYNC_LEVEL );
+	#ifdef PAL
+	fillwith( SHORT_SYNC_INTERVAL, SYNC_LEVEL );
+	fillwith( LONG_SYNC_INTERVAL, BLACK_LEVEL );
+	fillwith( SHORT_SYNC_INTERVAL, SYNC_LEVEL );
+	fillwith( LINE32LEN - (SHORT_SYNC_INTERVAL+LONG_SYNC_INTERVAL+SHORT_SYNC_INTERVAL), BLACK_LEVEL );
+	#else
+	fillwith( NORMAL_SYNC_INTERVAL, SYNC_LEVEL );
 	fillwith( 2, BLACK_LEVEL );
 	fillwith( 4, COLORBURST_LEVEL );
-	fillwith( LINE32LEN-12-6, BLACK_LEVEL );
+	fillwith( LINE32LEN-NORMAL_SYNC_INTERVAL-6, WHITE_LEVEL );
+	#endif
 	gline = -1;
 	gframe++;
 
@@ -226,7 +279,7 @@ LOCAL void FT_CLOSE_M()
 
 void (*CbTable[FT_MAX_d])() = { FT_STA, FT_STB, FT_B, FT_SRA, FT_SRB, FT_LIN, FT_CLOSE_M };
 
-LOCAL void slc_isr(void) {
+void slc_isr(void * v) {
 	//portBASE_TYPE HPTaskAwoken=0;
 	struct sdio_queue *finishedDesc;
 	uint32 slc_intr_status;
@@ -314,7 +367,7 @@ void ICACHE_FLASH_ATTR testi2s_init() {
 	SET_PERI_REG_MASK(SLC_RX_LINK, ((uint32)&i2sBufDesc[0]) & SLC_RXLINK_DESCADDR_MASK);
 
 	//Attach the DMA interrupt
-	ets_isr_attach(ETS_SLC_INUM, slc_isr);
+	ets_isr_attach(ETS_SLC_INUM, slc_isr, 0);
 	//Enable DMA operation intr
 	WRITE_PERI_REG(SLC_INT_ENA,  SLC_RX_EOF_INT_ENA);
 	//clear any interrupt flags that are set
@@ -337,8 +390,8 @@ void ICACHE_FLASH_ATTR testi2s_init() {
 
 	//Init pins to i2s functions
 	PIN_FUNC_SELECT(PERIPHS_IO_MUX_U0RXD_U, FUNC_I2SO_DATA);
-	PIN_FUNC_SELECT(PERIPHS_IO_MUX_GPIO2_U, FUNC_I2SO_WS);
-	PIN_FUNC_SELECT(PERIPHS_IO_MUX_MTDO_U, FUNC_I2SO_BCK);
+//	PIN_FUNC_SELECT(PERIPHS_IO_MUX_GPIO2_U, FUNC_I2SO_WS);
+//	PIN_FUNC_SELECT(PERIPHS_IO_MUX_MTDO_U, FUNC_I2SO_BCK);
 
 	//Enable clock to i2s subsystem
 	i2c_writeReg_Mask_def(i2c_bbpll, i2c_bbpll_en_audio_clock_out, 1);
